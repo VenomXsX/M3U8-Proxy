@@ -18,4 +18,4 @@ export declare function proxyM3U8(url: string, headers: any, res: http.ServerRes
  * @param req Client request object
  * @param res Server response object
  */
-export declare function proxyTs(url: string, headers: any, req: any, res: http.ServerResponse): Promise<null | undefined>;
+export declare function proxyTs(url: string, headers: any, req: any, res: http.ServerResponse): Promise<void>;

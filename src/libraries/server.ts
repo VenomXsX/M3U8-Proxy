@@ -288,7 +288,7 @@ function getHandler(options, proxy) {
             return !!(regexp.test(hostname) || net.isIPv4(hostname) || net.isIPv6(hostname));
         }
 
-        if (!/^\/https?:/.test(req.url) && !isValidHostName(location.hostname)) {
+        if (!/^\/https?:/.test(req.url)) {
             // Don't even try to proxy invalid hosts (such as /favicon.ico, /robots.txt)
 
             const uri = new URL(req.url ?? web_server_url, "http://localhost:3000");
@@ -435,6 +435,13 @@ const host = process.env.HOST || "0.0.0.0";
 const port = process.env.PORT || 8080;
 const web_server_url = process.env.PUBLIC_URL || `http://${host}:${port}`;
 
+// Helper function to properly join URL paths without double slashes
+function joinUrl(baseUrl: string, path: string): string {
+    const base = baseUrl.replace(/\/$/, ""); // Remove trailing slash from base
+    const pathPart = path.startsWith("/") ? path : "/" + path; // Ensure path starts with slash
+    return base + pathPart;
+}
+
 export default function server() {
     const originBlacklist = parseEnvList(process.env.CORSANYWHERE_BLACKLIST);
     const originWhitelist = parseEnvList(process.env.CORSANYWHERE_WHITELIST);
@@ -574,14 +581,14 @@ export async function proxyM3U8(url: string, headers: any, res: http.ServerRespo
             if (line.startsWith("#")) {
                 if (line.startsWith("#EXT-X-KEY:")) {
                     const regex = /https?:\/\/[^\""\s]+/g;
-                    const url = `${web_server_url}${"/ts-proxy?url=" + encodeURIComponent(regex.exec(line)?.[0] ?? "") + "&headers=" + encodeURIComponent(JSON.stringify(headers))}`;
+                    const url = joinUrl(web_server_url, "/ts-proxy?url=" + encodeURIComponent(regex.exec(line)?.[0] ?? "") + "&headers=" + encodeURIComponent(JSON.stringify(headers)));
                     newLines.push(line.replace(regex, url));
                 } else {
                     newLines.push(line);
                 }
             } else {
                 const uri = new URL(line, url);
-                newLines.push(`${web_server_url + "/m3u8-proxy?url=" + encodeURIComponent(uri.href) + "&headers=" + encodeURIComponent(JSON.stringify(headers))}`);
+                newLines.push(joinUrl(web_server_url, "/m3u8-proxy?url=" + encodeURIComponent(uri.href) + "&headers=" + encodeURIComponent(JSON.stringify(headers))));
             }
         }
 
@@ -603,7 +610,7 @@ export async function proxyM3U8(url: string, headers: any, res: http.ServerRespo
             if (line.startsWith("#")) {
                 if (line.startsWith("#EXT-X-KEY:")) {
                     const regex = /https?:\/\/[^\""\s]+/g;
-                    const url = `${web_server_url}${"/ts-proxy?url=" + encodeURIComponent(regex.exec(line)?.[0] ?? "") + "&headers=" + encodeURIComponent(JSON.stringify(headers))}`;
+                    const url = joinUrl(web_server_url, "/ts-proxy?url=" + encodeURIComponent(regex.exec(line)?.[0] ?? "") + "&headers=" + encodeURIComponent(JSON.stringify(headers)));
                     newLines.push(line.replace(regex, url));
                 } else {
                     newLines.push(line);
@@ -613,7 +620,7 @@ export async function proxyM3U8(url: string, headers: any, res: http.ServerRespo
                 // CORS is needed since the TS files are not on the same domain as the client.
                 // This replaces each TS file to use a TS proxy with the headers attached.
                 // So each TS request will use the headers inputted to the proxy
-                newLines.push(`${web_server_url}${"/ts-proxy?url=" + encodeURIComponent(uri.href) + "&headers=" + encodeURIComponent(JSON.stringify(headers))}`);
+                newLines.push(joinUrl(web_server_url, "/ts-proxy?url=" + encodeURIComponent(uri.href) + "&headers=" + encodeURIComponent(JSON.stringify(headers))));
             }
         }
 
@@ -650,50 +657,83 @@ export async function proxyTs(url: string, headers: any, req, res: http.ServerRe
     const uri = new URL(url);
 
     // Options
-    // It might be worth adding ...req.headers to the headers object, but once I did that
-    // the code broke and I receive errors such as "Cannot access direct IP" or whatever.
+    // Enhanced headers to better mimic a real browser request
+    const requestHeaders = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+        Connection: "keep-alive",
+        "Sec-Fetch-Dest": "video",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+        ...headers, // Apply custom headers after defaults
+    };
+
     const options = {
         hostname: uri.hostname,
         port: uri.port,
         path: uri.pathname + uri.search,
         method: req.method,
-        headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.132 Safari/537.36",
-            ...headers,
-        },
+        headers: requestHeaders,
     };
 
     // Proxy request and pipe to client
     try {
+        const handleResponse = (r) => {
+            // Check if this looks like an error page instead of a TS file
+            const contentType = r.headers["content-type"] || "";
+            const statusCode = r.statusCode || 0;
+            console.log(`TS Proxy: Received ${statusCode} for URL: ${url} with content-type: ${contentType}`);
+
+            // If we get HTML content, it's likely an error page (like Cloudflare block)
+            if (contentType.includes("text/html") || statusCode >= 400) {
+                console.error(`TS Proxy Error: Received ${statusCode} with content-type: ${contentType} for URL: ${url}`);
+                res.writeHead(statusCode, {
+                    "Content-Type": contentType,
+                    "Access-Control-Allow-Origin": "*",
+                });
+                r.pipe(res, { end: true });
+                return;
+            }
+
+            // For successful TS file responses, set proper headers
+            const responseHeaders = {
+                ...r.headers,
+                "content-type": contentType,
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Methods": "*",
+            };
+
+            res.writeHead(statusCode, responseHeaders);
+            r.pipe(res, { end: true });
+        };
+
         if (forceHTTPS) {
-            const proxy = https.request(options, (r) => {
-                r.headers["content-type"] = "video/mp2t";
-                res.writeHead(r.statusCode ?? 200, r.headers);
+            const proxy = https.request(options, handleResponse);
 
-                r.pipe(res, {
-                    end: true,
-                });
+            proxy.on("error", (err) => {
+                console.error("HTTPS Proxy Error:", err);
+                res.writeHead(500, { "Access-Control-Allow-Origin": "*" });
+                res.end("Proxy error: " + err.message);
             });
 
-            req.pipe(proxy, {
-                end: true,
-            });
+            req.pipe(proxy, { end: true });
         } else {
-            const proxy = http.request(options, (r) => {
-                r.headers["content-type"] = "video/mp2t";
-                res.writeHead(r.statusCode ?? 200, r.headers);
+            const proxy = http.request(options, handleResponse);
 
-                r.pipe(res, {
-                    end: true,
-                });
+            proxy.on("error", (err) => {
+                console.error("HTTP Proxy Error:", err);
+                res.writeHead(500, { "Access-Control-Allow-Origin": "*" });
+                res.end("Proxy error: " + err.message);
             });
-            req.pipe(proxy, {
-                end: true,
-            });
+
+            req.pipe(proxy, { end: true });
         }
     } catch (e: any) {
-        res.writeHead(500);
-        res.end(e.message);
-        return null;
+        console.error("TS Proxy Setup Error:", e);
+        res.writeHead(500, { "Access-Control-Allow-Origin": "*" });
+        res.end("Proxy setup error: " + e.message);
     }
 }
